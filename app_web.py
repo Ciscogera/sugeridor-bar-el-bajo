@@ -121,7 +121,7 @@ def ejecutar_calculo_matematico():
     st.session_state.excel_final = buffer.getvalue()
 
 # --- INTERFAZ WEB ---
-st.title("🍹 Pedidos Automáticos - El Bajo")
+st.title("Pedidos Automáticos: El Bajo")
 
 # --- ETAPA 1: CAPTURA DE FUENTES ---
 if st.session_state.etapa == "upload":
@@ -150,7 +150,7 @@ if st.session_state.etapa == "upload":
         input_ped = io.BytesIO(archivo_ped.read())
         
     if input_inv and input_ped:
-        if st.button("🔍 ANALIZAR PLANILLAS", use_container_width=True):
+        if st.button("ANALIZAR PLANILLAS", use_container_width=True):
             try:
                 # Guardamos los componentes en la sesión web global para evitar pérdidas en los reruns
                 st.session_state.inventario_db = cargar_inventario_real(input_inv)
@@ -193,7 +193,7 @@ if st.session_state.etapa == "upload":
 
 # --- ETAPA 2: RESOLVER VALIDACIONES ---
 elif st.session_state.etapa == "resolver":
-    st.subheader("⚠️ Validación de Productos")
+    st.subheader(" Validación de Productos")
     st.info(f"Faltan confirmar {len(st.session_state.ambiguedades)} productos. Selecciónalos:")
     
     with st.form("formulario_resolucion"):
@@ -219,7 +219,7 @@ elif st.session_state.etapa == "resolver":
 
 # --- ETAPA 3: DESCARGA FINAL ---
 elif st.session_state.etapa == "descargar":
-    st.subheader("🎯 ¡Sugerencias Listas!")
+    st.subheader("¡Sugerencias Listas!")
     st.success("Se ha calculado la reposición de todas tus marcas exitosamente.")
     
     st.download_button(
