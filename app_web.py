@@ -13,7 +13,7 @@ st.set_page_config(page_title="Pedidos El Bajo", page_icon="🍺", layout="cente
 
 # --- ⚠️ CONFIGURACIÓN DE REDIRECCIÓN OAUTH ---
 # Cambia a tu URL de Streamlit Cloud cuando subas el código a internet
-REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/" 
+REDIRECT_URI = "http://localhost:8501/" 
 
 # --- BASE DE DATOS DE COLUMNAS DE PROVEEDORES ---
 CONFIG_PROVEEDORES = {
@@ -32,10 +32,12 @@ CONFIG_PROVEEDORES = {
     "Limache": {"col_nombre": 1, "col_pedido": 2, "fila_inicio": 2},
     "Segafredo": {"col_nombre": 1, "col_pedido": 2, "fila_inicio": 4},
 }
-
-# --- CONTROL DE SESIÓN GENERAL ---
+ 
+# --- CONTROL DE SESIÓN GENERAL (BÓVEDA DE ESTADOS) ---
 if "credentials" not in st.session_state:
     st.session_state.credentials = None
+if "auth_procesada" not in st.session_state:
+    st.session_state.auth_procesada = False  # El guardián anti-bucle
 if "etapa" not in st.session_state:
     st.session_state.etapa = "login"
 if "ambiguedades" not in st.session_state:
@@ -49,26 +51,41 @@ if "pedidos_bytes" not in st.session_state:
 if "excel_final" not in st.session_state:
     st.session_state.excel_final = None
 
-# --- CAPTURA DE RETORNO GOOGLE (OAUTH HANDSHAKE) ---
-if st.session_state.credentials is None:
+# --- CAPTURA DE RETORNO GOOGLE (OAUTH HANDSHAKE OPTIMIZADO) ---
+# Solo entramos aquí si no tenemos credenciales Y si no hemos procesado un código en este ciclo
+if st.session_state.credentials is None and not st.session_state.auth_procesada:
     query_params = st.query_params
     if "code" in query_params:
         try:
+            # Intentar cargar desde la bóveda segura de la nube primero
             if "google_secrets" in st.secrets:
-                # Convertimos los secretos guardados en la web en un diccionario compatible con Google
                 client_config = {"web": dict(st.secrets["google_secrets"])}
-                
                 flow = Flow.from_client_config(
                     client_config,
                     scopes=['https://www.googleapis.com/auth/drive.readonly'],
                     redirect_uri=REDIRECT_URI
                 )
-                auth_url, _ = flow.authorization_url(prompt='select_account')
-                st.link_button("🔑 CONECTAR CON GOOGLE DRIVE", auth_url, use_container_width=True)
+            else:
+                # Respaldo local para pruebas en VS Code
+                flow = Flow.from_client_secrets_file(
+                    'client_secrets.json',
+                    scopes=['https://www.googleapis.com/auth/drive.readonly'],
+                    redirect_uri=REDIRECT_URI
+                )
+            
+            # Intercambiar el código único por las credenciales definitivas
+            flow.fetch_token(code=query_params["code"])
+            st.session_state.credentials = flow.credentials
+            st.session_state.auth_procesada = True  # Activamos el escudo
+            st.session_state.etapa = "upload"
+            
+            # Forzamos una recarga limpia interna de Streamlit sin destruir la memoria RAM de la sesión
+            st.rerun()
+            
         except Exception as e:
-            st.error(f"Error en la autenticación: {e}")
-else:
-    st.error("Por favor, configure las credenciales en la bóveda de secretos de Streamlit.")
+            # Si algo falla, lo mostramos en pantalla para saber exactamente qué regla de Google se rompió
+            st.error(f"⚠️ Error en intercambio de llaves de Google: {e}")
+            st.info("Verifica que la variable REDIRECT_URI coincida exactamente con la URL de tu navegador actual.")
 # --- FUNCIONES AUXILIARES DE GOOGLE DRIVE API ---
 def listar_archivos_excel():
     """Entra a la cuenta de Drive y extrae los nombres e IDs de los archivos .xlsx"""
