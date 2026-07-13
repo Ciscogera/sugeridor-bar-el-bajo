@@ -13,8 +13,7 @@ st.set_page_config(page_title="Pedidos El Bajo", page_icon="🍹", layout="cente
 
 # --- ⚠️ CONFIGURACIÓN DE REDIRECCIÓN OAUTH ---
 # Recuerda cambiar esta URL por la definitiva cuando lo subas a Streamlit Cloud
-# Ejemplo: REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/"
-REDIRECT_URI = "http://localhost:8501/" 
+REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/"
 
 # --- BASE DE DATOS DE COLUMNAS DE PROVEEDORES ---
 CONFIG_PROVEEDORES = {
