@@ -4,6 +4,8 @@ import pandas as pd
 import openpyxl
 import streamlit as st
 import io
+import random
+import string
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -13,7 +15,8 @@ st.set_page_config(page_title="Pedidos El Bajo", page_icon="🍹", layout="cente
 
 # --- ⚠️ CONFIGURACIÓN DE REDIRECCIÓN OAUTH ---
 # Recuerda cambiar esta URL por la definitiva cuando lo subas a Streamlit Cloud
-REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/"
+# Ejemplo: REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/"
+REDIRECT_URI = "http://localhost:8501/" 
 
 # --- BASE DE DATOS DE COLUMNAS DE PROVEEDORES ---
 CONFIG_PROVEEDORES = {
@@ -33,11 +36,15 @@ CONFIG_PROVEEDORES = {
     "Segafredo": {"col_nombre": 1, "col_pedido": 2, "fila_inicio": 4},
 }
 
-# --- CONTROL DE SESIÓN GENERAL (BÓVEDA DE ESTADOS) ---
+# --- AUXILIAR GENERADOR DE CLAVES (ANTI-RESET) ---
+def generar_state_pkce(length=64):
+    """Genera una clave criptográfica de un solo uso que resiste el reinicio de Streamlit."""
+    chars = string.ascii_letters + string.digits
+    return "".join(random.choice(chars) for _ in range(length))
+
+# --- CONTROL DE SESIÓN GENERAL ---
 if "credentials" not in st.session_state:
     st.session_state.credentials = None
-if "flow" not in st.session_state:
-    st.session_state.flow = None  # Guardará el flujo OAuth con el verificador de código intacto
 if "auth_procesada" not in st.session_state:
     st.session_state.auth_procesada = False
 if "etapa" not in st.session_state:
@@ -53,28 +60,46 @@ if "pedidos_bytes" not in st.session_state:
 if "excel_final" not in st.session_state:
     st.session_state.excel_final = None
 
-# --- CAPTURA DE RETORNO GOOGLE (OAUTH HANDSHAKE) ---
+# --- CAPTURA DE RETORNO GOOGLE (OAUTH HANDSHAKE OPTIMIZADO) ---
 if st.session_state.credentials is None and not st.session_state.auth_procesada:
     query_params = st.query_params
-    if "code" in query_params:
+    if "code" in query_params and "state" in query_params:
         try:
-            # Usamos estrictamente el objeto flow guardado en sesión que tiene la clave criptográfica correcta
-            if st.session_state.flow is not None:
-                flow = st.session_state.flow
-                flow.fetch_token(code=query_params["code"])
+            code = query_params["code"]
+            state_retornado = query_params["state"]
+            
+            # Reconstruimos el flujo usando el state recuperado como code_verifier
+            if "google_secrets" in st.secrets:
+                client_config = {"web": dict(st.secrets["google_secrets"])}
+                flow = Flow.from_client_config(
+                    client_config,
+                    scopes=['https://www.googleapis.com/auth/drive.readonly'],
+                    redirect_uri=REDIRECT_URI,
+                    code_verifier=state_retornado  # 💥 EL TRUCO: El state de la URL es nuestro verificador
+                )
+            elif os.path.exists('client_secrets.json'):
+                flow = Flow.from_client_secrets_file(
+                    'client_secrets.json',
+                    scopes=['https://www.googleapis.com/auth/drive.readonly'],
+                    redirect_uri=REDIRECT_URI,
+                    code_verifier=state_retornado
+                )
+            else:
+                flow = None
+                
+            if flow is not None:
+                flow.fetch_token(code=code)
                 st.session_state.credentials = flow.credentials
                 st.session_state.auth_procesada = True
                 st.session_state.etapa = "upload"
-                st.query_params.clear() # Limpia la barra de direcciones
+                st.query_params.clear() # Limpia la barra de direcciones de la URL
                 st.rerun()
             else:
-                st.error("⚠️ Error: Sesión de autenticación expirada. Por favor, intente iniciar sesión de nuevo.")
-                st.session_state.etapa = "login"
+                st.error("Error al inicializar el flujo de canje de tokens.")
+                
         except Exception as e:
             st.error(f"⚠️ Error en intercambio de llaves de Google: {e}")
             st.info("Verifica que la variable REDIRECT_URI coincida exactamente con la URL de tu navegador actual.")
-            # Reseteamos estados para permitir reintento limpio
-            st.session_state.flow = None
             st.session_state.auth_procesada = False
             st.session_state.etapa = "login"
 
@@ -158,25 +183,30 @@ if st.session_state.etapa == "login" and st.session_state.credentials is None:
     st.subheader("Acceso a Canales de Almacenamiento")
     st.write("Conéctate de forma segura a Google Drive para listar tus planillas de stock.")
     
-    # Creamos el objeto flow una sola vez y lo persistimos en st.session_state.flow
-    if st.session_state.flow is None:
-        if "google_secrets" in st.secrets:
-            client_config = {"web": dict(st.secrets["google_secrets"])}
-            st.session_state.flow = Flow.from_client_config(
-                client_config,
-                scopes=['https://www.googleapis.com/auth/drive.readonly'],
-                redirect_uri=REDIRECT_URI
-            )
-        elif os.path.exists('client_secrets.json'):
-            st.session_state.flow = Flow.from_client_secrets_file(
-                'client_secrets.json',
-                scopes=['https://www.googleapis.com/auth/drive.readonly'],
-                redirect_uri=REDIRECT_URI
-            )
-            
-    if st.session_state.flow is not None:
-        # Al pedir la URL de autorización, el objeto flow interno genera y guarda el verificador PKCE
-        auth_url, _ = st.session_state.flow.authorization_url(prompt='select_account')
+    # Generamos la clave secreta que servirá como code_verifier y state simultáneamente
+    mi_state_secreto = generar_state_pkce()
+    
+    if "google_secrets" in st.secrets:
+        client_config = {"web": dict(st.secrets["google_secrets"])}
+        flow = Flow.from_client_config(
+            client_config,
+            scopes=['https://www.googleapis.com/auth/drive.readonly'],
+            redirect_uri=REDIRECT_URI,
+            code_verifier=mi_state_secreto  # Pre-cargamos la clave
+        )
+    elif os.path.exists('client_secrets.json'):
+        flow = Flow.from_client_secrets_file(
+            'client_secrets.json',
+            scopes=['https://www.googleapis.com/auth/drive.readonly'],
+            redirect_uri=REDIRECT_URI,
+            code_verifier=mi_state_secreto
+        )
+    else:
+        flow = None
+        
+    if flow is not None:
+        # Enviamos la clave como parámetro 'state' para que Google nos la devuelva
+        auth_url, _ = flow.authorization_url(prompt='select_account', state=mi_state_secreto)
         st.link_button("🔑 CONECTAR CON GOOGLE DRIVE", auth_url, use_container_width=True)
     else:
         st.error("Falta el archivo 'client_secrets.json' o la configuración en Secrets de Streamlit.")
