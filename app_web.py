@@ -15,7 +15,8 @@ st.set_page_config(page_title="Pedidos El Bajo", page_icon="🍹", layout="cente
 
 # --- ⚠️ CONFIGURACIÓN DE REDIRECCIÓN OAUTH ---
 # Recuerda cambiar esta URL por la definitiva cuando lo subas a Streamlit Cloud
-REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/"
+# Ejemplo: REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/"
+REDIRECT_URI = "http://localhost:8501/" 
 
 # --- BASE DE DATOS DE COLUMNAS DE PROVEEDORES ---
 CONFIG_PROVEEDORES = {
@@ -37,7 +38,6 @@ CONFIG_PROVEEDORES = {
 
 # --- AUXILIAR GENERADOR DE CLAVES (ANTI-RESET) ---
 def generar_state_pkce(length=64):
-    """Genera una clave criptográfica de un solo uso que resiste el reinicio de Streamlit."""
     chars = string.ascii_letters + string.digits
     return "".join(random.choice(chars) for _ in range(length))
 
@@ -47,7 +47,7 @@ if "credentials" not in st.session_state:
 if "auth_procesada" not in st.session_state:
     st.session_state.auth_procesada = False
 if "etapa" not in st.session_state:
-    st.session_state.etapa = "login"
+    st.session_state.etapa = "upload" # Cambiado por defecto para mostrar las pestañas al tiro
 if "ambiguedades" not in st.session_state:
     st.session_state.ambiguedades = {}
 if "cache_decisiones" not in st.session_state:
@@ -59,7 +59,7 @@ if "pedidos_bytes" not in st.session_state:
 if "excel_final" not in st.session_state:
     st.session_state.excel_final = None
 
-# --- CAPTURA DE RETORNO GOOGLE (OAUTH HANDSHAKE OPTIMIZADO) ---
+# --- CAPTURA DE RETORNO GOOGLE (OAUTH HANDSHAKE) ---
 if st.session_state.credentials is None and not st.session_state.auth_procesada:
     query_params = st.query_params
     if "code" in query_params and "state" in query_params:
@@ -67,14 +67,13 @@ if st.session_state.credentials is None and not st.session_state.auth_procesada:
             code = query_params["code"]
             state_retornado = query_params["state"]
             
-            # Reconstruimos el flujo usando el state recuperado como code_verifier
             if "google_secrets" in st.secrets:
                 client_config = {"web": dict(st.secrets["google_secrets"])}
                 flow = Flow.from_client_config(
                     client_config,
                     scopes=['https://www.googleapis.com/auth/drive.readonly'],
                     redirect_uri=REDIRECT_URI,
-                    code_verifier=state_retornado  # 💥 EL TRUCO: El state de la URL es nuestro verificador
+                    code_verifier=state_retornado
                 )
             elif os.path.exists('client_secrets.json'):
                 flow = Flow.from_client_secrets_file(
@@ -91,16 +90,13 @@ if st.session_state.credentials is None and not st.session_state.auth_procesada:
                 st.session_state.credentials = flow.credentials
                 st.session_state.auth_procesada = True
                 st.session_state.etapa = "upload"
-                st.query_params.clear() # Limpia la barra de direcciones de la URL
+                st.query_params.clear()
                 st.rerun()
-            else:
-                st.error("Error al inicializar el flujo de canje de tokens.")
                 
         except Exception as e:
             st.error(f"⚠️ Error en intercambio de llaves de Google: {e}")
-            st.info("Verifica que la variable REDIRECT_URI coincida exactamente con la URL de tu navegador actual.")
             st.session_state.auth_procesada = False
-            st.session_state.etapa = "login"
+            st.session_state.etapa = "upload"
 
 # --- FUNCIONES AUXILIARES DE GOOGLE DRIVE API ---
 def listar_archivos_excel():
@@ -174,107 +170,130 @@ def ejecutar_calculo_matematico():
     wb.save(buffer)
     st.session_state.excel_final = buffer.getvalue()
 
+# --- 📦 UNIFICACIÓN DE ANÁLISIS Y ESCÁNER ---
+def procesar_escaner_ambiguedades(io_inv, io_ped):
+    """Función de un solo propósito que prepara la base de datos y busca alertas."""
+    st.session_state.inventario_db = cargar_inventario_real(io_inv)
+    st.session_state.pedidos_bytes = io_ped.getvalue() if hasattr(io_ped, "getvalue") else io_ped.read()
+    
+    nombres_inv = list(st.session_state.inventario_db.keys())
+    wb_scan = openpyxl.load_workbook(io.BytesIO(st.session_state.pedidos_bytes))
+    ambiguedades_encontradas = {}
+    
+    for sheet_name in wb_scan.sheetnames:
+        if sheet_name not in CONFIG_PROVEEDORES: continue
+        ws = wb_scan[sheet_name]
+        conf = CONFIG_PROVEEDORES[sheet_name]
+        
+        for row in range(conf["fila_inicio"], ws.max_row + 1):
+            cell_val = ws.cell(row=row, column=conf["col_nombre"]).value
+            if not cell_val: continue
+            n_prov = str(cell_val).strip()
+            if n_prov.lower() in ["productos", "producto", "total", "rut:", "detalle de producto"]: continue
+            
+            res, tipo_match = encontrar_coincidencia_inteligente(n_prov, nombres_inv)
+            if tipo_match in ["ALTA_CERTEZA", "PERFECTO"]:
+                st.session_state.cache_decisiones[n_prov] = res
+            elif tipo_match in ["DUPLICADO", "BAJA_CERTEZA"]:
+                ambiguedades_encontradas[n_prov] = {"candidatos": res, "tipo": tipo_match}
+                
+    st.session_state.ambiguedades = ambiguedades_encontradas
+    if ambiguedades_encontradas:
+        st.session_state.etapa = "resolver"
+    else:
+        ejecutar_calculo_matematico()
+        st.session_state.etapa = "descargar"
+    st.rerun()
+
 # --- INTERFAZ DE USUARIO ---
-st.title("🍹 Pedidos Integrados - El Bajo")
+st.title("🍹 Pedidos Automáticos - El Bajo")
 
-# --- ETAPA 0: AUTENTICACIÓN ---
-if st.session_state.etapa == "login" and st.session_state.credentials is None:
-    st.subheader("Acceso a Canales de Almacenamiento")
-    st.write("Conéctate de forma segura a Google Drive para listar tus planillas de stock.")
+# --- ETAPA 1: OBTENCIÓN DE ARCHIVOS (HÍBRIDO: DRIVE o LOCAL) ---
+if st.session_state.etapa == "upload":
+    st.subheader("1. Selección del Origen de Planillas")
     
-    # Generamos la clave secreta que servirá como code_verifier y state simultáneamente
-    mi_state_secreto = generar_state_pkce()
+    # 📑 LAS PESTAÑAS HAN VUELTO
+    tab_drive, tab_local = st.tabs(["🔗 Google Drive (Nube)", "📂 Archivos Locales (PC/Móvil)"])
     
-    if "google_secrets" in st.secrets:
-        client_config = {"web": dict(st.secrets["google_secrets"])}
-        flow = Flow.from_client_config(
-            client_config,
-            scopes=['https://www.googleapis.com/auth/drive.readonly'],
-            redirect_uri=REDIRECT_URI,
-            code_verifier=mi_state_secreto  # Pre-cargamos la clave
-        )
-    elif os.path.exists('client_secrets.json'):
-        flow = Flow.from_client_secrets_file(
-            'client_secrets.json',
-            scopes=['https://www.googleapis.com/auth/drive.readonly'],
-            redirect_uri=REDIRECT_URI,
-            code_verifier=mi_state_secreto
-        )
-    else:
-        flow = None
-        
-    if flow is not None:
-        # Enviamos la clave como parámetro 'state' para que Google nos la devuelva
-        auth_url, _ = flow.authorization_url(prompt='select_account', state=mi_state_secreto)
-        st.link_button("🔑 CONECTAR CON GOOGLE DRIVE", auth_url, use_container_width=True)
-    else:
-        st.error("Falta el archivo 'client_secrets.json' o la configuración en Secrets de Streamlit.")
-
-# --- ETAPA 1: SELECCIÓN DE ARCHIVOS DIRECTO DESDE DRIVE ---
-elif st.session_state.etapa == "upload" or st.session_state.credentials is not None:
-    if st.session_state.etapa == "login": 
-        st.session_state.etapa = "upload"
-        
-    if st.session_state.etapa == "upload":
-        st.subheader("1. Selección de Planillas en la Nube")
-        
-        with st.spinner("Leyendo archivos de tu Google Drive..."):
-            diccionario_archivos = listar_archivos_excel()
+    # --- PESTAÑA A: GOOGLE DRIVE ---
+    with tab_drive:
+        if st.session_state.credentials is None:
+            st.write("Conéctate de forma segura a Google Drive para listar tus planillas de stock.")
+            mi_state_secreto = generar_state_pkce()
             
-        if diccionario_archivos:
-            opciones_excel = ["-- Seleccionar un archivo --"] + list(diccionario_archivos.keys())
-            
-            archivo_inv_name = st.selectbox("Elija el Inventario Diario Digitalizado:", options=opciones_excel)
-            archivo_ped_name = st.selectbox("Elija el Maestro de Pedidos (Plantilla):", options=opciones_excel)
-            
-            if archivo_inv_name != "-- Seleccionar un archivo --" and archivo_ped_name != "-- Seleccionar un archivo --":
-                if st.button("🔍 ANALIZAR PLANILLAS SELECCIONADAS", use_container_width=True):
-                    try:
-                        id_inv = diccionario_archivos[archivo_inv_name]
-                        id_ped = diccionario_archivos[archivo_ped_name]
-                        
-                        with st.spinner("Descargando y escaneando datos del Bar..."):
-                            io_inv = descargar_archivo_desde_drive(id_inv)
-                            io_ped = descargar_archivo_desde_drive(id_ped)
-                            
-                            st.session_state.inventario_db = cargar_inventario_real(io_inv)
-                            st.session_state.pedidos_bytes = io_ped.getvalue()
-                            
-                            nombres_inv = list(st.session_state.inventario_db.keys())
-                            wb_scan = openpyxl.load_workbook(io.BytesIO(st.session_state.pedidos_bytes))
-                            ambiguedades_encontradas = {}
-                            
-                            for sheet_name in wb_scan.sheetnames:
-                                if sheet_name not in CONFIG_PROVEEDORES: continue
-                                ws = wb_scan[sheet_name]
-                                conf = CONFIG_PROVEEDORES[sheet_name]
-                                
-                                for row in range(conf["fila_inicio"], ws.max_row + 1):
-                                    cell_val = ws.cell(row=row, column=conf["col_nombre"]).value
-                                    if not cell_val: continue
-                                    n_prov = str(cell_val).strip()
-                                    if n_prov.lower() in ["productos", "producto", "total", "rut:", "detalle de producto"]: continue
-                                    
-                                    res, tipo_match = encontrar_coincidencia_inteligente(n_prov, nombres_inv)
-                                    if tipo_match in ["ALTA_CERTEZA", "PERFECTO"]:
-                                        st.session_state.cache_decisiones[n_prov] = res
-                                    elif tipo_match in ["DUPLICADO", "BAJA_CERTEZA"]:
-                                        ambiguedades_encontradas[n_prov] = {"candidatos": res, "tipo": tipo_match}
-                            
-                            st.session_state.ambiguedades = ambiguedades_encontradas
-                            if ambiguedades_encontradas:
-                                st.session_state.etapa = "resolver"
-                            else:
-                                ejecutar_calculo_matematico()
-                                st.session_state.etapa = "descargar"
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Fallo en lectura de celdas: {e}")
+            if "google_secrets" in st.secrets:
+                client_config = {"web": dict(st.secrets["google_secrets"])}
+                flow = Flow.from_client_config(
+                    client_config,
+                    scopes=['https://www.googleapis.com/auth/drive.readonly'],
+                    redirect_uri=REDIRECT_URI,
+                    code_verifier=mi_state_secreto
+                )
+            elif os.path.exists('client_secrets.json'):
+                flow = Flow.from_client_secrets_file(
+                    'client_secrets.json',
+                    scopes=['https://www.googleapis.com/auth/drive.readonly'],
+                    redirect_uri=REDIRECT_URI,
+                    code_verifier=mi_state_secreto
+                )
+            else:
+                flow = None
+                
+            if flow is not None:
+                auth_url, _ = flow.authorization_url(prompt='select_account', state=mi_state_secreto)
+                st.link_button("🔑 CONECTAR CON GOOGLE DRIVE", auth_url, use_container_width=True)
+            else:
+                st.error("Falta el archivo 'client_secrets.json' o la configuración en Secrets de Streamlit.")
         else:
-            st.warning("No se encontraron archivos Excel (.xlsx) en la raíz de tu Google Drive.")
+            st.success("🟢 Cuenta vinculada exitosamente.")
+            
+            with st.spinner("Leyendo archivos de tu Google Drive..."):
+                diccionario_archivos = listar_archivos_excel()
+                
+            if diccionario_archivos:
+                opciones_excel = ["-- Seleccionar un archivo --"] + list(diccionario_archivos.keys())
+                
+                archivo_inv_name = st.selectbox("Elija el Inventario Diario Digitalizado:", options=opciones_excel, key="drive_inv")
+                archivo_ped_name = st.selectbox("Elija el Maestro de Pedidos (Plantilla):", options=opciones_excel, key="drive_ped")
+                
+                if archivo_inv_name != "-- Seleccionar un archivo --" and archivo_ped_name != "-- Seleccionar un archivo --":
+                    if st.button("🔍 ANALIZAR PLANILLAS DE DRIVE", use_container_width=True):
+                        try:
+                            id_inv = diccionario_archivos[archivo_inv_name]
+                            id_ped = diccionario_archivos[archivo_ped_name]
+                            
+                            with st.spinner("Descargando y escaneando datos del Bar..."):
+                                io_inv = descargar_archivo_desde_drive(id_inv)
+                                io_ped = descargar_archivo_desde_drive(id_ped)
+                                # Enviamos los archivos descargados al procesador unificado
+                                procesar_escaner_ambiguedades(io_inv, io_ped)
+                        except Exception as e:
+                            st.error(f"Fallo en lectura de celdas de Drive: {e}")
+            else:
+                st.warning("No se encontraron archivos Excel (.xlsx) en la raíz de tu Google Drive.")
+                if st.button("🔄 Intentar reconectar cuenta"):
+                    st.session_state.credentials = None
+                    st.session_state.auth_procesada = False
+                    st.rerun()
 
-# --- ETAPA 2: RESOLVER AMBIGÜEDADES ---
-if st.session_state.etapa == "resolver":
+    # --- PESTAÑA B: ARCHIVOS LOCALES (SIN CUENTAS) ---
+    with tab_local:
+        st.write("Sube tus archivos directamente desde tu computador o celular sin vincular ninguna cuenta.")
+        archivo_inv_local = st.file_uploader("Sube el Inventario Diario Digitalizado (.xlsx)", type=["xlsx"], key="local_inv")
+        archivo_ped_local = st.file_uploader("Sube el Maestro de Pedidos original (.xlsx)", type=["xlsx"], key="local_ped")
+        
+        if archivo_inv_local and archivo_ped_local:
+            if st.button("🔍 ANALIZAR PLANILLAS LOCALES", use_container_width=True):
+                try:
+                    io_inv = io.BytesIO(archivo_inv_local.read())
+                    io_ped = io.BytesIO(archivo_ped_local.read())
+                    # Enviamos los bytes cargados al mismo procesador unificado
+                    procesar_escaner_ambiguedades(io_inv, io_ped)
+                except Exception as e:
+                    st.error(f"Fallo en procesamiento local: {e}")
+
+# --- ETAPA 2: RESOLVER AMBIGÜEDADES (PANTALLA INTERACTIVA) ---
+elif st.session_state.etapa == "resolver":
     st.subheader("⚠️ Validación de Nombres")
     st.info(f"Faltan confirmar {len(st.session_state.ambiguedades)} productos:")
     
@@ -312,8 +331,11 @@ elif st.session_state.etapa == "descargar":
     )
     
     if st.button("🔄 Procesar Nuevas Planillas", use_container_width=True):
+        # Mantenemos las credenciales activas en caché para no tener que reconectar Drive de inmediato
         credenciales_actuales = st.session_state.credentials
+        auth_actual = st.session_state.auth_procesada
         st.session_state.clear()
         st.session_state.credentials = credenciales_actuales
+        st.session_state.auth_procesada = auth_actual
         st.session_state.etapa = "upload"
         st.rerun()
