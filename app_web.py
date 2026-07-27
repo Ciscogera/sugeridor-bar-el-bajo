@@ -1,5 +1,6 @@
 import os
 import difflib
+import re
 import pandas as pd
 import openpyxl
 import streamlit as st
@@ -46,7 +47,7 @@ if "credentials" not in st.session_state:
 if "auth_procesada" not in st.session_state:
     st.session_state.auth_procesada = False
 if "etapa" not in st.session_state:
-    st.session_state.etapa = "upload" # Cambiado por defecto para mostrar las pestañas al tiro
+    st.session_state.etapa = "upload"
 if "ambiguedades" not in st.session_state:
     st.session_state.ambiguedades = {}
 if "cache_decisiones" not in st.session_state:
@@ -130,29 +131,59 @@ def cargar_inventario_real(file_io):
     df["Barra"] = pd.to_numeric(df["Barra"], errors="coerce").fillna(0)
     df["Total Actual"] = df["Bodega"] + df["Barra"]
     
-    # 💥 PARCHE 1: Agrupamos por producto para que no se sobreescriban los 'Par Stock' de filas duplicadas
-    #df_agrupado = df.groupby(df["Nombre Producto"].str.strip()).agg({
-      #  "Par Stock": "sum",
-     #   "Total Actual": "sum"
-    #}).reset_index()
+    # Agrupamos por producto para evitar pérdida de registros duplicados
+    df_agrupado = df.groupby(df["Nombre Producto"].str.strip()).agg({
+        "Par Stock": "sum",
+        "Total Actual": "sum"
+    }).reset_index()
     
-    #return {str(r["Nombre Producto"]): {"par": r["Par Stock"], "actual": r["Total Actual"]}}
+    return {str(r["Nombre Producto"]): {"par": r["Par Stock"], "actual": r["Total Actual"]} for _, r in df_agrupado.iterrows()}
+
+def normalizar_texto_producto(texto):
+    """Limpia el texto y estandariza las unidades de medida/volumen."""
+    t = str(texto).lower().strip()
+    t = re.sub(r'[()\-.,_]', ' ', t)
+    t = re.sub(r'\b(750\s*ml|750\s*cc|750)\b', '750cc', t)
+    t = re.sub(r'\b(1\s*l|1\s*litro|litro|1000\s*ml|1000\s*cc|1000)\b', 'litro', t)
+    t = re.sub(r'\b(330\s*ml|330\s*cc)\b', '330cc', t)
+    t = re.sub(r'\b(355\s*ml|355\s*cc)\b', '355cc', t)
+    t = re.sub(r'\b(500\s*ml|500\s*cc)\b', '500cc', t)
+    return re.sub(r'\s+', ' ', t).strip()
 
 def encontrar_coincidencia_inteligente(nombre_prov, lista_inv):
-    n_prov_clean = nombre_prov.lower().strip()
+    n_prov_raw = nombre_prov.lower().strip()
+    n_prov_norm = normalizar_texto_producto(nombre_prov)
     
-    # 💥 PARCHE 2: Si el nombre coincide al 100%, es PERFECTO y no se envía a "Resolver Ambigüedades"
-    coincidencia_exacta = [n for n in lista_inv if n_prov_clean == n.lower().strip()]
-    if len(coincidencia_exacta) == 1:
-        return coincidencia_exacta[0], "PERFECTO"
-    
-    exactas = [n for n in lista_inv if n_prov_clean in n.lower().strip() or n.lower().strip() in n_prov_clean]
-    if len(exactas) == 1: return exactas[0], "PERFECTO"
-    if len(exactas) > 1: return exactas, "DUPLICADO"
-    
+    # 1. Coincidencia exacta (cruda o normalizada)
+    for item in lista_inv:
+        if n_prov_raw == item.lower().strip() or n_prov_norm == normalizar_texto_producto(item):
+            return item, "PERFECTO"
+            
+    # 2. Sub-texto con desempate inteligente por volumen
+    exactas = []
+    for item in lista_inv:
+        item_norm = normalizar_texto_producto(item)
+        if n_prov_norm in item_norm or item_norm in n_prov_norm:
+            exactas.append(item)
+            
+    if len(exactas) == 1: 
+        return exactas[0], "PERFECTO"
+    if len(exactas) > 1: 
+        if "750cc" in n_prov_norm:
+            filtrados = [x for x in exactas if "750" in normalizar_texto_producto(x)]
+            if len(filtrados) == 1: return filtrados[0], "PERFECTO"
+        elif "litro" in n_prov_norm:
+            filtrados = [x for x in exactas if "litro" in normalizar_texto_producto(x)]
+            if len(filtrados) == 1: return filtrados[0], "PERFECTO"
+        return exactas, "DUPLICADO"
+        
+    # 3. Fuzzy Match con difflib
     mejores = difflib.get_close_matches(nombre_prov, lista_inv, n=3, cutoff=0.4)
-    if not mejores: return None, "NINGUNO"
-    if difflib.SequenceMatcher(None, n_prov_clean, mejores[0].lower()).ratio() < 0.90:
+    if not mejores: 
+        return None, "NINGUNO"
+    
+    ratio = difflib.SequenceMatcher(None, n_prov_norm, normalizar_texto_producto(mejores[0])).ratio()
+    if ratio < 0.85:
         return mejores, "BAJA_CERTEZA"
     return mejores[0], "ALTA_CERTEZA"
 
@@ -171,7 +202,10 @@ def ejecutar_calculo_matematico():
             n_prov = str(cell_val).strip()
             if n_prov.lower() in ["productos", "producto", "total", "rut:", "detalle de producto"]: continue
             
-            item_elegido = st.session_state.cache_decisiones.get(n_prov)
+            # Usamos la clave única por fila
+            clave_unica = f"{sheet_name}_f{row}_{n_prov}"
+            item_elegido = st.session_state.cache_decisiones.get(clave_unica)
+            
             if item_elegido and item_elegido in inventario:
                 datos = inventario[item_elegido]
                 cantidad = max(0, datos["par"] - datos["actual"])
@@ -183,9 +217,8 @@ def ejecutar_calculo_matematico():
     wb.save(buffer)
     st.session_state.excel_final = buffer.getvalue()
 
-# --- 📦 UNIFICACIÓN DE ANÁLISIS Y ESCÁNER ---
+# --- UNIFICACIÓN DE ANÁLISIS Y ESCÁNER ---
 def procesar_escaner_ambiguedades(io_inv, io_ped):
-    """Función de un solo propósito que prepara la base de datos y busca alertas."""
     st.session_state.inventario_db = cargar_inventario_real(io_inv)
     st.session_state.pedidos_bytes = io_ped.getvalue() if hasattr(io_ped, "getvalue") else io_ped.read()
     
@@ -204,11 +237,19 @@ def procesar_escaner_ambiguedades(io_inv, io_ped):
             n_prov = str(cell_val).strip()
             if n_prov.lower() in ["productos", "producto", "total", "rut:", "detalle de producto"]: continue
             
+            # Generamos clave única vinculada a la fila exacta de la hoja
+            clave_unica = f"{sheet_name}_f{row}_{n_prov}"
             res, tipo_match = encontrar_coincidencia_inteligente(n_prov, nombres_inv)
+            
             if tipo_match in ["ALTA_CERTEZA", "PERFECTO"]:
-                st.session_state.cache_decisiones[n_prov] = res
+                st.session_state.cache_decisiones[clave_unica] = res
             elif tipo_match in ["DUPLICADO", "BAJA_CERTEZA"]:
-                ambiguedades_encontradas[n_prov] = {"candidatos": res, "tipo": tipo_match}
+                ambiguedades_encontradas[clave_unica] = {
+                    "nombre_prov": n_prov,
+                    "hoja": sheet_name,
+                    "candidatos": res,
+                    "tipo": tipo_match
+                }
                 
     st.session_state.ambiguedades = ambiguedades_encontradas
     if ambiguedades_encontradas:
@@ -219,16 +260,13 @@ def procesar_escaner_ambiguedades(io_inv, io_ped):
     st.rerun()
 
 # --- INTERFAZ DE USUARIO ---
-st.title(" Pedidos Automáticos - El Bajo")
+st.title("🍹 Pedidos Automáticos - El Bajo")
 
-# --- ETAPA 1: OBTENCIÓN DE ARCHIVOS (HÍBRIDO: DRIVE o LOCAL) ---
+# --- ETAPA 1: OBTENCIÓN DE ARCHIVOS ---
 if st.session_state.etapa == "upload":
     st.subheader("1. Selección del Origen de Planillas")
-    
-    # 📑 LAS PESTAÑAS HAN VUELTO
     tab_drive, tab_local = st.tabs(["🔗 Google Drive (Nube)", "📂 Archivos Locales (PC/Móvil)"])
     
-    # --- PESTAÑA A: GOOGLE DRIVE ---
     with tab_drive:
         if st.session_state.credentials is None:
             st.write("Conéctate de forma segura a Google Drive para listar tus planillas de stock.")
@@ -259,13 +297,11 @@ if st.session_state.etapa == "upload":
                 st.error("Falta el archivo 'client_secrets.json' o la configuración en Secrets de Streamlit.")
         else:
             st.success("🟢 Cuenta vinculada exitosamente.")
-            
             with st.spinner("Leyendo archivos de tu Google Drive..."):
                 diccionario_archivos = listar_archivos_excel()
                 
             if diccionario_archivos:
                 opciones_excel = ["-- Seleccionar un archivo --"] + list(diccionario_archivos.keys())
-                
                 archivo_inv_name = st.selectbox("Elija el Inventario Diario Digitalizado:", options=opciones_excel, key="drive_inv")
                 archivo_ped_name = st.selectbox("Elija el Maestro de Pedidos (Plantilla):", options=opciones_excel, key="drive_ped")
                 
@@ -274,11 +310,9 @@ if st.session_state.etapa == "upload":
                         try:
                             id_inv = diccionario_archivos[archivo_inv_name]
                             id_ped = diccionario_archivos[archivo_ped_name]
-                            
                             with st.spinner("Descargando y escaneando datos del Bar..."):
                                 io_inv = descargar_archivo_desde_drive(id_inv)
                                 io_ped = descargar_archivo_desde_drive(id_ped)
-                                # Enviamos los archivos descargados al procesador unificado
                                 procesar_escaner_ambiguedades(io_inv, io_ped)
                         except Exception as e:
                             st.error(f"Fallo en lectura de celdas de Drive: {e}")
@@ -289,7 +323,6 @@ if st.session_state.etapa == "upload":
                     st.session_state.auth_procesada = False
                     st.rerun()
 
-    # --- PESTAÑA B: ARCHIVOS LOCALES (SIN CUENTAS) ---
     with tab_local:
         st.write("Sube tus archivos directamente desde tu computador o celular sin vincular ninguna cuenta.")
         archivo_inv_local = st.file_uploader("Sube el Inventario Diario Digitalizado (.xlsx)", type=["xlsx"], key="local_inv")
@@ -300,12 +333,11 @@ if st.session_state.etapa == "upload":
                 try:
                     io_inv = io.BytesIO(archivo_inv_local.read())
                     io_ped = io.BytesIO(archivo_ped_local.read())
-                    # Enviamos los bytes cargados al mismo procesador unificado
                     procesar_escaner_ambiguedades(io_inv, io_ped)
                 except Exception as e:
                     st.error(f"Fallo en procesamiento local: {e}")
 
-# --- ETAPA 2: RESOLVER AMBIGÜEDADES (PANTALLA INTERACTIVA) ---
+# --- ETAPA 2: RESOLVER AMBIGÜEDADES ---
 elif st.session_state.etapa == "resolver":
     st.subheader("⚠️ Validación de Nombres")
     st.info(f"Faltan confirmar {len(st.session_state.ambiguedades)} productos:")
@@ -314,16 +346,22 @@ elif st.session_state.etapa == "resolver":
         nuevas_decisiones = {}
         bloque_items = list(st.session_state.ambiguedades.items())[:12]
         
-        for n_prov, info in bloque_items:
+        for clave_unica, info in bloque_items:
+            n_prov = info["nombre_prov"]
+            hoja = info["hoja"]
             tipo_texto = "Duplicado" if info["tipo"] == "DUPLICADO" else "Certeza Baja"
             options_select = ["[ No pedir ]"] + info["candidatos"]
-            nuevas_decisiones[n_prov] = st.selectbox(label=f"📋 '{n_prov}' ({tipo_texto})", options=options_select, key=n_prov)
+            nuevas_decisiones[clave_unica] = st.selectbox(
+                label=f"📋 '{n_prov}' (Hoja: {hoja} | {tipo_texto})", 
+                options=options_select, 
+                key=clave_unica
+            )
             st.markdown("---")
             
         if st.form_submit_button("💾 GUARDAR ASOCIACIONES Y CONTINUAR", use_container_width=True):
-            for n_prov, eleccion in nuevas_decisiones.items():
-                st.session_state.cache_decisiones[n_prov] = None if eleccion == "[ No pedir ]" else eleccion
-                del st.session_state.ambiguedades[n_prov]
+            for clave_unica, eleccion in nuevas_decisiones.items():
+                st.session_state.cache_decisiones[clave_unica] = None if eleccion == "[ No pedir ]" else eleccion
+                del st.session_state.ambiguedades[clave_unica]
             
             if not st.session_state.ambiguedades:
                 ejecutar_calculo_matematico()
@@ -344,7 +382,6 @@ elif st.session_state.etapa == "descargar":
     )
     
     if st.button("🔄 Procesar Nuevas Planillas", use_container_width=True):
-        # Mantenemos las credenciales activas en caché para no tener que reconectar Drive de inmediato
         credenciales_actuales = st.session_state.credentials
         auth_actual = st.session_state.auth_procesada
         st.session_state.clear()
