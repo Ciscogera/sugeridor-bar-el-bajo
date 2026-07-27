@@ -11,12 +11,11 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 # --- CONFIGURACIÓN DE LA PÁGINA WEB ---
-st.set_page_config(page_title="Pedidos El Bajo", page_icon="🍹", layout="centered")
+st.set_page_config(page_title="Pedidos El Bajo", page_icon="", layout="centered")
 
 # --- ⚠️ CONFIGURACIÓN DE REDIRECCIÓN OAUTH ---
 # Recuerda cambiar esta URL por la definitiva cuando lo subas a Streamlit Cloud
 REDIRECT_URI = "https://sugeridor-bar-el-bajo.streamlit.app/"
-
 
 # --- BASE DE DATOS DE COLUMNAS DE PROVEEDORES ---
 CONFIG_PROVEEDORES = {
@@ -130,13 +129,27 @@ def cargar_inventario_real(file_io):
     df["Bodega"] = pd.to_numeric(df["Bodega"], errors="coerce").fillna(0)
     df["Barra"] = pd.to_numeric(df["Barra"], errors="coerce").fillna(0)
     df["Total Actual"] = df["Bodega"] + df["Barra"]
-    return {str(r["Nombre Producto"]).strip(): {"par": r["Par Stock"], "actual": r["Total Actual"]} for _, r in df.iterrows()}
+    
+    # 💥 PARCHE 1: Agrupamos por producto para que no se sobreescriban los 'Par Stock' de filas duplicadas
+    df_agrupado = df.groupby(df["Nombre Producto"].str.strip()).agg({
+        "Par Stock": "sum",
+        "Total Actual": "sum"
+    }).reset_index()
+    
+    return {str(r["Nombre Producto"]): {"par": r["Par Stock"], "actual": r["Total Actual"]} for _, r in df_agrupado.iterrows()}
 
 def encontrar_coincidencia_inteligente(nombre_prov, lista_inv):
     n_prov_clean = nombre_prov.lower().strip()
+    
+    # 💥 PARCHE 2: Si el nombre coincide al 100%, es PERFECTO y no se envía a "Resolver Ambigüedades"
+    coincidencia_exacta = [n for n in lista_inv if n_prov_clean == n.lower().strip()]
+    if len(coincidencia_exacta) == 1:
+        return coincidencia_exacta[0], "PERFECTO"
+    
     exactas = [n for n in lista_inv if n_prov_clean in n.lower().strip() or n.lower().strip() in n_prov_clean]
     if len(exactas) == 1: return exactas[0], "PERFECTO"
     if len(exactas) > 1: return exactas, "DUPLICADO"
+    
     mejores = difflib.get_close_matches(nombre_prov, lista_inv, n=3, cutoff=0.4)
     if not mejores: return None, "NINGUNO"
     if difflib.SequenceMatcher(None, n_prov_clean, mejores[0].lower()).ratio() < 0.90:
