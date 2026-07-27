@@ -131,12 +131,12 @@ def cargar_inventario_real(file_io):
     df["Total Actual"] = df["Bodega"] + df["Barra"]
     
     # 💥 PARCHE 1: Agrupamos por producto para que no se sobreescriban los 'Par Stock' de filas duplicadas
-    df_agrupado = df.groupby(df["Nombre Producto"].str.strip()).agg({
-        "Par Stock": "sum",
-        "Total Actual": "sum"
-    }).reset_index()
+    #df_agrupado = df.groupby(df["Nombre Producto"].str.strip()).agg({
+      #  "Par Stock": "sum",
+     #   "Total Actual": "sum"
+    #}).reset_index()
     
-    return {str(r["Nombre Producto"]): {"par": r["Par Stock"], "actual": r["Total Actual"]} for _, r in df_agrupado.iterrows()}
+    #return {str(r["Nombre Producto"]): {"par": r["Par Stock"], "actual": r["Total Actual"]}}
 
 def encontrar_coincidencia_inteligente(nombre_prov, lista_inv):
     n_prov_clean = nombre_prov.lower().strip()
@@ -219,7 +219,7 @@ def procesar_escaner_ambiguedades(io_inv, io_ped):
     st.rerun()
 
 # --- INTERFAZ DE USUARIO ---
-st.title("🍹 Pedidos Automáticos - El Bajo")
+st.title(" Pedidos Automáticos - El Bajo")
 
 # --- ETAPA 1: OBTENCIÓN DE ARCHIVOS (HÍBRIDO: DRIVE o LOCAL) ---
 if st.session_state.etapa == "upload":
