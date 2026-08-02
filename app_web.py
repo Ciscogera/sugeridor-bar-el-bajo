@@ -140,52 +140,57 @@ def cargar_inventario_real(file_io):
     return {str(r["Nombre Producto"]): {"par": r["Par Stock"], "actual": r["Total Actual"]} for _, r in df_agrupado.iterrows()}
 
 def normalizar_texto_producto(texto):
-    """Limpia el texto y estandariza las unidades de medida/volumen."""
+    """Limpia el texto, remueve muletillas de inventario y estandariza unidades."""
     t = str(texto).lower().strip()
-    t = re.sub(r'[()\-.,_]', ' ', t)
-    t = re.sub(r'\b(750\s*ml|750\s*cc|750)\b', '750cc', t)
-    t = re.sub(r'\b(1\s*l|1\s*litro|litro|1000\s*ml|1000\s*cc|1000)\b', 'litro', t)
-    t = re.sub(r'\b(330\s*ml|330\s*cc)\b', '330cc', t)
-    t = re.sub(r'\b(355\s*ml|355\s*cc)\b', '355cc', t)
-    t = re.sub(r'\b(500\s*ml|500\s*cc)\b', '500cc', t)
-    return re.sub(r'\s+', ' ', t).strip()
+    t = re.sub(r"[()\-.,_']", " ", t)
+    # Remueve palabras comodín de inventario que los proveedores no usan
+    t = re.sub(r"\b(normal|tradicional|comun|estandar)\b", " ", t)
+    t = re.sub(r"\b(750\s*ml|750\s*cc|750)\b", "750cc", t)
+    t = re.sub(r"\b(1\s*l|1\s*litro|litro|1000\s*ml|1000\s*cc|1000)\b", "litro", t)
+    t = re.sub(r"\b(330\s*ml|330\s*cc)\b", "330cc", t)
+    t = re.sub(r"\b(355\s*ml|355\s*cc)\b", "355cc", t)
+    t = re.sub(r"\b(500\s*ml|500\s*cc)\b", "500cc", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 def encontrar_coincidencia_inteligente(nombre_prov, lista_inv):
     n_prov_raw = nombre_prov.lower().strip()
     n_prov_norm = normalizar_texto_producto(nombre_prov)
     
-    # 1. Coincidencia exacta (cruda o normalizada)
+    # 1. Coincidencia exacta
     for item in lista_inv:
         if n_prov_raw == item.lower().strip() or n_prov_norm == normalizar_texto_producto(item):
             return item, "PERFECTO"
             
-    # 2. Sub-texto con desempate inteligente por volumen
+    # 2. Sub-texto con desempate por especificidad de nombre
     exactas = []
     for item in lista_inv:
         item_norm = normalizar_texto_producto(item)
-        if n_prov_norm in item_norm or item_norm in n_prov_norm:
+        if item_norm and (n_prov_norm in item_norm or item_norm in n_prov_norm):
             exactas.append(item)
             
     if len(exactas) == 1: 
         return exactas[0], "PERFECTO"
     if len(exactas) > 1: 
-        if "750cc" in n_prov_norm:
-            filtrados = [x for x in exactas if "750" in normalizar_texto_producto(x)]
-            if len(filtrados) == 1: return filtrados[0], "PERFECTO"
-        elif "litro" in n_prov_norm:
-            filtrados = [x for x in exactas if "litro" in normalizar_texto_producto(x)]
-            if len(filtrados) == 1: return filtrados[0], "PERFECTO"
+        # Priorizar el texto de mayor longitud para diferenciar variantes (ej: "Flora Adora" vs "Hendricks")
+        max_len = max(len(normalizar_texto_producto(x)) for x in exactas)
+        mas_especificos = [x for x in exactas if len(normalizar_texto_producto(x)) == max_len]
+        if len(mas_especificos) == 1:
+            return mas_especificos[0], "PERFECTO"
         return exactas, "DUPLICADO"
         
-    # 3. Fuzzy Match con difflib
-    mejores = difflib.get_close_matches(nombre_prov, lista_inv, n=3, cutoff=0.4)
-    if not mejores: 
-        return None, "NINGUNO"
+    # 3. Fuzzy Match sobre cadenas normalizadas (Case-Insensitive)
+    mapa_norm = {normalizar_texto_producto(x): x for x in lista_inv}
+    mejores_norm = difflib.get_close_matches(n_prov_norm, list(mapa_norm.keys()), n=3, cutoff=0.3)
     
-    ratio = difflib.SequenceMatcher(None, n_prov_norm, normalizar_texto_producto(mejores[0])).ratio()
+    if not mejores_norm: 
+        return list(lista_inv), "BAJA_CERTEZA"
+    
+    mejores_orig = [mapa_norm[m] for m in mejores_norm]
+    ratio = difflib.SequenceMatcher(None, n_prov_norm, mejores_norm[0]).ratio()
+    
     if ratio < 0.85:
-        return mejores, "BAJA_CERTEZA"
-    return mejores[0], "ALTA_CERTEZA"
+        return mejores_orig, "BAJA_CERTEZA"
+    return mejores_orig[0], "ALTA_CERTEZA"
 
 def ejecutar_calculo_matematico():
     wb = openpyxl.load_workbook(io.BytesIO(st.session_state.pedidos_bytes))
@@ -237,17 +242,17 @@ def procesar_escaner_ambiguedades(io_inv, io_ped):
             n_prov = str(cell_val).strip()
             if n_prov.lower() in ["productos", "producto", "total", "rut:", "detalle de producto"]: continue
             
-            # Generamos clave única vinculada a la fila exacta de la hoja
             clave_unica = f"{sheet_name}_f{row}_{n_prov}"
             res, tipo_match = encontrar_coincidencia_inteligente(n_prov, nombres_inv)
             
             if tipo_match in ["ALTA_CERTEZA", "PERFECTO"]:
                 st.session_state.cache_decisiones[clave_unica] = res
-            elif tipo_match in ["DUPLICADO", "BAJA_CERTEZA"]:
+            else:
+                # Captura DUPLICADO, BAJA_CERTEZA y NINGUNO para resolver en la interfaz
                 ambiguedades_encontradas[clave_unica] = {
                     "nombre_prov": n_prov,
                     "hoja": sheet_name,
-                    "candidatos": res,
+                    "candidatos": res if isinstance(res, list) else [res],
                     "tipo": tipo_match
                 }
                 
@@ -260,7 +265,7 @@ def procesar_escaner_ambiguedades(io_inv, io_ped):
     st.rerun()
 
 # --- INTERFAZ DE USUARIO ---
-st.title("🍹 Pedidos Automáticos - El Bajo")
+st.title("Pedidos Automáticos - El Bajo")
 
 # --- ETAPA 1: OBTENCIÓN DE ARCHIVOS ---
 if st.session_state.etapa == "upload":
